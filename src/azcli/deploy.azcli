@@ -1,0 +1,115 @@
+SUBSCRIPTION_ID="" # here enter your subscription id
+KUBE_GROUP="nopublicipaks" # here enter the resources group name of your aks cluster
+KUBE_NAME="ezprivatekube" # here enter the name of your kubernetes resource
+LOCATION="southcentralus" # here enter the datacenter location
+VNET_GROUP="hubnet" # here the name of the resource group for the vnet and hub resources
+KUBE_VNET_NAME="spoke1-kubevnet" # here enter the name of your vnet
+KUBE_ING_SUBNET_NAME="ing-1-subnet" # here enter the name of your ingress subnet
+KUBE_AGENT_SUBNET_NAME="aks-2-subnet" # here enter the name of your aks subnet
+HUB_VNET_NAME="hub1-fwnet"
+HUB_FW_SUBNET_NAME="AzureFirewallSubnet" # this you cannot change
+HUB_JUMP_SUBNET_NAME="jumpbox-subnet"
+FW_NAME="ejvkubenetfw" # here enter the name of your azure firewall resource
+FW_IP_NAME="azureFirewall-ip" # here enter the name of your public ip resource for the firewall
+FW_PRIVATE_IP="10.0.0.4" # this is the internal ip of our azure firewall
+FW_ROUTE_NAME="${FW_NAME}_fw_r" # azure firewall force tunneling route name
+FW_ROUTE_TABLE_NAME="${FW_NAME}_fw_rt" # our new user defined route to force all traffic to the azure firewall
+KUBE_VERSION="1.15.7" # here enter the kubernetes version of your aks
+SERVICE_PRINCIPAL_ID="" # here enter the service principal of your aks
+SERVICE_PRINCIPAL_SECRET="" # here enter the service principal secret
+HUB_VNET_CIDR="10.0.0.0/22"
+KUBE_VNET_CIDR="172.16.0.0/16"
+HUB_FW_SUBNET_CIDR="10.0.0.0/24"
+HUB_JUMP_SUBNET_CIDR="10.0.1.0/24"
+KUBE_ING_SUBNET_CIDR="172.16.8.0/24"
+KUBE_AGENT_SUBNET_CIDR="172.16.0.0/21"
+POD_CIDR="172.20.0.0/16"
+SVC_CIDR="172.21.0.0/16"
+DNS_SVC_IP="172.21.0.10"
+
+
+# Register the private link Preview provider - ONLY DO ONCE PER SUBSCRIPTION
+az feature register --name AKSPrivateLinkPreview --namespace Microsoft.ContainerService
+az feature list -o table --query "[?contains(name, 'Microsoft.ContainerService/AKSPrivateLinkPreview')].{Name:name,State:properties.state}"
+az provider register --namespace Microsoft.ContainerService 
+az provider register --namespace Microsoft.Network
+
+#create the virtual networks, subnets and peerings between them
+az account set --subscription $SUBSCRIPTION_ID
+az group create -n $KUBE_GROUP -l $LOCATION
+az group create -n $VNET_GROUP -l $LOCATION
+az network vnet create -g $VNET_GROUP -n $HUB_VNET_NAME --address-prefixes ${HUB_VNET_CIDR}
+az network vnet create -g $VNET_GROUP -n $KUBE_VNET_NAME --address-prefixes ${KUBE_VNET_CIDR}
+az network vnet subnet create -g $VNET_GROUP --vnet-name $HUB_VNET_NAME -n $HUB_FW_SUBNET_NAME --address-prefix ${HUB_FW_SUBNET_CIDR}
+az network vnet subnet create -g $VNET_GROUP --vnet-name $HUB_VNET_NAME -n $HUB_JUMP_SUBNET_NAME --address-prefix ${HUB_JUMP_SUBNET_CIDR}
+az network vnet subnet create -g $VNET_GROUP --vnet-name $KUBE_VNET_NAME -n $KUBE_ING_SUBNET_NAME --address-prefix ${KUBE_ING_SUBNET_CIDR}
+az network vnet subnet create -g $VNET_GROUP --vnet-name $KUBE_VNET_NAME -n $KUBE_AGENT_SUBNET_NAME --address-prefix ${KUBE_AGENT_SUBNET_CIDR}
+az network vnet peering create -g $VNET_GROUP -n HubToSpoke1 --vnet-name $HUB_VNET_NAME --remote-vnet $KUBE_VNET_NAME --allow-vnet-access
+az network vnet peering create -g $VNET_GROUP -n Spoke1ToHub --vnet-name $KUBE_VNET_NAME --remote-vnet $HUB_VNET_NAME --allow-vnet-access
+
+# service principal needs permissions on the virtual network
+az role assignment create --role "Contributor" --assignee $SERVICE_PRINCIPAL_ID -g $VNET_GROUP
+
+# configure the azure firewall public ip and the azure firewall
+az extension add --name azure-firewall
+az network public-ip create -g $VNET_GROUP -n $FW_IP_NAME --sku Standard
+az network firewall create --name $FW_NAME --resource-group $VNET_GROUP --location $LOCATION
+az network firewall ip-config create --firewall-name $FW_NAME --name $FW_NAME --public-ip-address $FW_IP_NAME \
+    --resource-group $VNET_GROUP --private-ip-address $FW_PRIVATE_IP --vnet-name $HUB_VNET_NAME
+
+# creating a user defined route which will force all traffic from the aks subnet to the internal ip of the azure firewall (which is an ip address that we know to be 10.0.0.4)
+KUBE_AGENT_SUBNET_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$VNET_GROUP/providers/Microsoft.Network/virtualNetworks/$KUBE_VNET_NAME/subnets/$KUBE_AGENT_SUBNET_NAME"
+az network route-table create -g $VNET_GROUP --name $FW_ROUTE_TABLE_NAME
+az network route-table route create --resource-group $VNET_GROUP --name $FW_ROUTE_NAME --route-table-name $FW_ROUTE_TABLE_NAME \
+    --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $FW_PRIVATE_IP --subscription $SUBSCRIPTION_ID
+az network vnet subnet update --resource-group $VNET_GROUP --route-table $FW_ROUTE_TABLE_NAME --ids $KUBE_AGENT_SUBNET_ID
+az network route-table route list --resource-group $VNET_GROUP --route-table-name $FW_ROUTE_TABLE_NAME
+
+# Create AKS required Network Rules
+az network firewall network-rule create --firewall-name $FW_NAME --collection-name "tunneltcp" --destination-addresses "*"  --destination-ports 9000 --name "allow network" \
+    --protocols "TCP" --resource-group $VNET_GROUP --source-addresses "*" --action "Allow" --description "aks tunnel tcp port" --priority 103
+az network firewall network-rule create --firewall-name $FW_NAME --collection-name "tunneludp" --destination-addresses "*"  --destination-ports 1194 --name "allow network" \
+    --protocols "UDP" --resource-group $VNET_GROUP --source-addresses "*" --action "Allow" --description "aks tunnel udp port" --priority 104
+az network firewall network-rule create --firewall-name $FW_NAME --collection-name "time" --destination-addresses "*"  --destination-ports 123 --name "allow network" \
+    --protocols "UDP" --resource-group $VNET_GROUP --source-addresses "*" --action "Allow" --description "aks node time sync rule" --priority 101
+az network firewall network-rule create --firewall-name $FW_NAME --collection-name "dns" --destination-addresses "*"  --destination-ports 53 --name "allow network" \
+    --protocols "UDP" --resource-group $VNET_GROUP --source-addresses "*" --action "Allow" --description "aks node dns rule" --priority 102
+az network firewall network-rule create --firewall-name $FW_NAME --collection-name "servicetags" \
+    --destination-addresses "AzureContainerRegistry" "MicrosoftContainerRegistry" "AzureActiveDirectory" --destination-ports "*" \
+    --name "allow service tags" --protocols "Any" --resource-group $VNET_GROUP --source-addresses "*" --action "Allow" --description "allow service tags" \
+    --priority 110
+
+# Create AKS required Application Rules
+az network firewall application-rule create  --firewall-name $FW_NAME --collection-name "aksbase" --name "allow network" \
+    --protocols http=80 https=443 --source-addresses "*" --resource-group $VNET_GROUP --action "Allow" \
+    --target-fqdns "*.data.mcr.microsoft.com" "mcr.microsoft.com" "*.hcp.${LOCATION}.cx.aks.containerservice.azure.us" "*.tun.${LOCATION}.cx.aks.containerservice.azure.us" "management.azure.com" "login.microsoftonline.com" "acs-mirror.azureedge.net" \
+    --priority 100
+
+az network firewall application-rule create  --firewall-name $FW_NAME --collection-name "akstools" --name "allow network" \
+    --protocols http=80 https=443 --source-addresses "*" --resource-group $VNET_GROUP --action "Allow" \
+    --target-fqdns "dc.services.visualstudio.com" "*.opinsights.azure.com" "*.monitoring.azure.com" "gov-prod-policy-data.trafficmanager.net" "apt.dockerproject.org" "nvidia.github.io" \
+    --priority 101
+az network firewall application-rule create  --firewall-name $FW_NAME --collection-name "osupdates" \
+    --name "allow network" --protocols http=80 https=443 --source-addresses "*" --resource-group $VNET_GROUP --action "Allow" \
+    --target-fqdns "download.opensuse.org" "*.ubuntu.com" "packages.microsoft.com" "snapcraft.io" "api.snapcraft.io" "security.ubuntu.com" "azure.archive.ubuntu.com" "changelogs.ubuntu.com"  --priority 102
+
+# Create AKs Cluster
+az aks create --name ${KUBE_NAME} --resource-group ${KUBE_GROUP} --location ${LOCATION} --dns-name-prefix ${KUBE_NAME} \
+    --kubernetes-version ${KUBE_VERSION} --vnet-subnet-id ${KUBE_AGENT_SUBNET_ID} --service-principal ${SERVICE_PRINCIPAL_ID} \
+    --client-secret ${SERVICE_PRINCIPAL_SECRET} --network-plugin kubenet --network-policy calico --nodepool-name basepool \
+    --pod-cidr ${POD_CIDR} --service-cidr ${SVC_CIDR} --dns-service-ip ${DNS_SVC_IP} --min-count 3 --max-count 5 \
+    --enable-pod-security-policy
+
+
+# Update default UDR for Kubenet to add default route to Azure Firewall
+AKS_MC_RG=$(az group list --query "[?starts_with(name, 'KUBE_NAME_${KUBE_GROUP}_nodes_${LOCATION}')].name | [0]" --output tsv)
+az network vnet subnet update --route-table "" --network-security-group "" --ids ${KUBE_AGENT_SUBNET_ID}
+ROUTE_TABLE_ID=$(az network route-table list -g ${AKS_MC_RG} --query "[].id | [0]" -o tsv)
+ROUTE_TABLE_NAME=$(az network route-table list -g ${AKS_MC_RG} --query "[].name | [0]" -o tsv)
+AKS_NODE_NSG=$(az network nsg list -g ${AKS_MC_RG} --query "[].id | [0]" -o tsv)
+az network vnet subnet update --resource-group $KUBE_GROUP --route-table $ROUTE_TABLE_ID --network-security-group $AKS_NODE_NSG --ids $KUBE_AGENT_SUBNET_ID
+az network route-table route create --resource-group $AKS_MC_RG --name $FW_ROUTE_NAME --route-table-name $ROUTE_TABLE_NAME --address-prefix 0.0.0.0/0 --next-hop-type VirtualAppliance --next-hop-ip-address $FW_PRIVATE_IP --subscription $SUBSCRIPTION_ID
+
+# Add Additional Node Pools if needed
+
+az aks nodepool add --cluster-name ${KUBE_NAME} --name pool2 --resource-group ${KUBE_GROUP} --max-count 5 --min-count 3 --vnet-subnet-id ${KUBE_AGENT_SUBNET_ID} --enable-cluster-autoscaler 
