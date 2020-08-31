@@ -81,12 +81,16 @@ resource azurerm_kubernetes_cluster main {
 }
 
 output "api_fqdn" {
-  value       = azurerm_kubernetes_cluster.main.fqdn
+  value       = azurerm_kubernetes_cluster.main.private_fqdn
   description = "The FQDN of the Azure Kubernetes Managed Cluster"
 }
 
 output "aks_id" {
   value       = azurerm_kubernetes_cluster.main.id
-  description = "The FQDN of the Azure Kubernetes Managed Cluster"
+  description = "The resource ID of the AKS Cluster"
 }
 
+output "node_rg" {
+  value = azurerm_kubernetes_cluster.main.node_resource_group
+  description = "The name of the resource group for the AKS Node Pools"
+}
