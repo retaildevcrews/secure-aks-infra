@@ -1,7 +1,3 @@
-locals {
-  api_server_authList = split(",", var.AUTH_IP_RANGES)
-}
-
 resource azurerm_kubernetes_cluster main {
   lifecycle {
     ignore_changes = [
@@ -45,7 +41,7 @@ resource azurerm_kubernetes_cluster main {
     vnet_subnet_id      = var.AKS_SUBNET_ID
   }
 
-  #private_cluster_enabled = true
+  private_cluster_enabled = true
   #private_link_enabled    = true
   
   network_profile {
@@ -82,9 +78,6 @@ resource azurerm_kubernetes_cluster main {
   #     client_secret = azuread_service_principal_password.akssp.value
   #   }
 
-  api_server_authorized_ip_ranges = local.api_server_authList
-
-  enable_pod_security_policy = true
 }
 
 output "api_fqdn" {
